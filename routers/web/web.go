@@ -272,10 +272,6 @@ func Routes() *web.Router {
 	// Get user from session if logged in.
 	mid = append(mid, webAuth(buildAuthGroup()))
 
-	if setting.Service.QoS.Enabled {
-		mid = append(mid, common.QoS())
-	}
-
 	// GetHead allows a HEAD request redirect to GET if HEAD method is not defined for that route
 	mid = append(mid, chi_middleware.GetHead)
 
@@ -289,17 +285,17 @@ func Routes() *web.Router {
 	mid = append(mid, repo.GetActiveStopwatch)
 	mid = append(mid, goGet)
 
-	others := web.NewRouter()
-	others.Use(mid...)
-	registerRoutes(others)
-	routes.Mount("", others)
+	webRoutes := web.NewRouter()
+	webRoutes.Use(mid...)
+	webRoutes.Group("", func() { registerWebRoutes(webRoutes) }, common.QoS())
+
+	routes.Mount("", webRoutes)
 	return routes
 }
 
 var optSignInIgnoreCsrf = verifyAuthWithOptions(&common.VerifyOptions{DisableCSRF: true})
 
-// registerRoutes register routes
-func registerRoutes(m *web.Router) {
+func registerWebRoutes(m *web.Router) {
 	// required to be signed in or signed out
 	reqSignIn := verifyAuthWithOptions(&common.VerifyOptions{SignInRequired: true})
 	reqSignOut := verifyAuthWithOptions(&common.VerifyOptions{SignOutRequired: true})

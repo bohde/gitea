@@ -4,42 +4,27 @@
 package common
 
 import (
-	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	user_model "code.gitea.io/gitea/models/user"
+	"code.gitea.io/gitea/modules/reqctx"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/web/middleware"
 
 	"github.com/bohde/codel"
+	"github.com/go-chi/chi/v5"
 )
 
-type Priority int
-
-func (p Priority) String() string {
-	switch p {
-	case HighPriority:
-		return "high"
-	case DefaultPriority:
-		return "default"
-	case LowPriority:
-		return "low"
-	default:
-		return fmt.Sprintf("%d", p)
-	}
-}
-
-const (
-	LowPriority     = Priority(-10)
-	DefaultPriority = Priority(0)
-	HighPriority    = Priority(10)
-)
-
-// QoS implements quality of service for requests, based upon whether
-// or not the user is logged in. All traffic may get dropped, and
-// anonymous users are deprioritized.
+// QoS implements quality of service for requests, based upon
+// whether the user is logged in. All traffic may get dropped,
+// and anonymous users are deprioritized.
 func QoS() func(next http.Handler) http.Handler {
+	if !setting.Service.QoS.Enabled {
+		return nil
+	}
+
 	maxOutstanding := setting.Service.QoS.MaxInFlightRequests
 	if maxOutstanding <= 0 {
 		maxOutstanding = 10
@@ -57,30 +42,18 @@ func QoS() func(next http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			ctx := req.Context()
-
-			priority := DefaultPriority
-
-			// If the user is logged in, assign high priority.
-			data := middleware.GetContextData(req.Context())
-			if _, ok := data[middleware.ContextDataKeySignedUser].(*user_model.User); ok {
-				priority = HighPriority
-			} else if IsGitContents(req.URL.Path) {
-				// Otherwise, if the path would is accessing git contents directly, mark as low priority
-				priority = LowPriority
-			}
+			priority, longPolling := determineRequestPriority(reqctx.FromContext(req.Context()))
 
 			// Check if the request can begin processing.
-			err := c.Acquire(ctx, int(priority))
+			err := c.Acquire(req.Context(), priority)
 			if err != nil {
 				// If it failed, the service is over capacity and should error
-				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+				http.Error(w, "Service Unavailable (QoS)", http.StatusServiceUnavailable)
 				return
 			}
 
-			// Release long-polling immediately, so they don't always
-			// take up an in-flight request
-			if strings.Contains(req.URL.Path, "/user/events") {
+			if longPolling {
+				// Release long-polling immediately, so they don't always take up an in-flight request
 				c.Release()
 			} else {
 				defer c.Release()
@@ -91,31 +64,52 @@ func QoS() func(next http.Handler) http.Handler {
 	}
 }
 
-func IsGitContents(path string) bool {
+func isRoutePathLowPriority(routePattern string) bool {
+	subPath, ok := strings.CutPrefix(routePattern, "/{username}/{reponame}/")
+	if !ok {
+		return false
+	}
+	subPath, _, _ = strings.Cut(subPath, "/")
 	parts := []string{
-		"refs",
+		"activity",
 		"archive",
-		"commit",
-		"graph",
 		"blame",
 		"branches",
-		"tags",
-		"labels",
-		"stars",
-		"search",
-		"activity",
-		"wiki",
-		"watchers",
-		"compare",
-		"raw",
-		"src",
+		"commit",
 		"commits",
+		"compare",
+		"graph",
+		"labels",
+		"media",
+		"raw",
+		"search",
+		"src",
+		"stars",
+		"tags",
+		"watchers",
+		"wiki",
+	}
+	return slices.Contains(parts, subPath)
+}
+
+func isRoutePathForLongPolling(routePattern string) bool {
+	return routePattern == "/user/events"
+}
+
+// TODO: add some tests
+
+func determineRequestPriority(reqCtx reqctx.RequestContext) (priority int, longPolling bool) {
+	const priorityLow = -10
+	const priorityHigh = 10
+
+	chiRoutePath := chi.RouteContext(reqCtx).RoutePattern()
+	if _, ok := reqCtx.GetData()[middleware.ContextDataKeySignedUser].(*user_model.User); ok {
+		// If the user is logged in, assign high priority.
+		priority = priorityHigh
+	} else if isRoutePathLowPriority(chiRoutePath) {
+		// Otherwise, if the path would is accessing git contents directly, mark as low priority
+		priority = priorityLow
 	}
 
-	for _, p := range parts {
-		if strings.Contains(path, p) {
-			return true
-		}
-	}
-	return false
+	return priority, isRoutePathForLongPolling(chiRoutePath)
 }
